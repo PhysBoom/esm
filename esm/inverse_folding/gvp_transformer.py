@@ -103,38 +103,35 @@ class GVPTransformerModel(nn.Module):
         return encoder_out
 
     def sample(self, coords, B: int, partial_seq=None, temperature=1.0, confidence=None, device=None):
-        import torch
-        import torch.nn.functional as F
 
         if device is None:
             device = next(self.parameters()).device
         device = torch.device(device)
 
-        # CoordBatchConverter in ESM-IF1 typically expects python/numpy coords
+        # CoordBatchConverter expects python/numpy coords in most ESM IF1 builds
         if torch.is_tensor(coords):
-            coords_in = coords.detach().cpu().numpy()
             L = coords.shape[0]
+            coords_in = coords.detach().cpu().numpy()
         else:
-            coords_in = coords
             L = len(coords)
+            coords_in = coords
 
         batch_converter = CoordBatchConverter(self.decoder.dictionary)
-        batch_coords, confidence, _, _, padding_mask = (
-            batch_converter([(coords_in, confidence, None)], device=device)
-        )
+        batch_coords, confidence, _, _, padding_mask = batch_converter([(coords_in, confidence, None)], device=device)
 
         d = self.decoder.dictionary
+        V = len(d)
+
         mask_idx = d.get_idx("<mask>")
         cath_idx = d.get_idx("<cath>")
 
-        # Fixed positions (CPU list to avoid CUDA sync in Python)
+        # fixed positions
         fixed = [False] * L
         if partial_seq is not None:
             for j, c in enumerate(partial_seq):
                 if c is not None and c != "<mask>":
                     fixed[j] = True
 
-        # Tokens on GPU
         sampled_tokens = torch.full((B, 1 + L), mask_idx, device=device, dtype=torch.long)
         sampled_tokens[:, 0] = cath_idx
 
@@ -150,6 +147,12 @@ class GVPTransformerModel(nn.Module):
             for i in range(1, L + 1):
                 if fixed[i - 1]:
                     continue
+
+                # Guard: token ids must be valid before decoder (catches root cause)
+                mn = int(sampled_tokens[:, :i].min().detach().cpu())
+                mx = int(sampled_tokens[:, :i].max().detach().cpu())
+                if mn < 0 or mx >= V:
+                    raise RuntimeError(f"Token id out of range before decoder at i={i}: min={mn}, max={mx}, vocab={V}")
 
                 logits, _ = self.decoder(
                     sampled_tokens[:, :i],
@@ -168,13 +171,24 @@ class GVPTransformerModel(nn.Module):
                 else:
                     raise RuntimeError(f"Can't infer batch dim: logits={tuple(logits.shape)} B={B}")
 
-                # IMPORTANT: take the last timestep available (avoids off-by-one)
-                step_logits = logits_tbv[-1]     # [B, V]
+                step_logits = logits_tbv[-1]  # [B, V]
 
+                # Sanitize numeric issues
+                step_logits = torch.nan_to_num(step_logits, nan=-1e9, posinf=1e9, neginf=-1e9)
                 probs = F.softmax(step_logits / temperature, dim=-1)
-                sampled_tokens[:, i] = torch.multinomial(probs, 1).squeeze(-1)
+                probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+                probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+                next_tok = torch.multinomial(probs, 1).squeeze(-1)  # [B]
+                # Another guard
+                if (next_tok < 0).any() or (next_tok >= V).any():
+                    bad = next_tok[(next_tok < 0) | (next_tok >= V)][:10].detach().cpu().tolist()
+                    raise RuntimeError(f"Sampled out-of-range token(s) at i={i}: {bad} (vocab={V})")
+
+                sampled_tokens[:, i] = next_tok
 
         ids = sampled_tokens[:, 1:].detach().cpu().tolist()
         return ["".join(d.get_tok(t) for t in row) for row in ids]
+
 
 
