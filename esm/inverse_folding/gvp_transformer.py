@@ -110,9 +110,6 @@ class GVPTransformerModel(nn.Module):
             (typically a python/numpy structure; if you have a torch tensor,
                 pass coords.detach().cpu().numpy()).
         """
-        import torch
-        import torch.nn.functional as F
-
         if device is None:
             device = next(self.parameters()).device
         device = torch.device(device)
