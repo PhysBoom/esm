@@ -110,7 +110,8 @@ def get_sequence_loss(model, alphabet, coords, seq):
     batch_converter = CoordBatchConverter(alphabet)
     batch = [(coords, None, seq)]
     coords, confidence, strs, tokens, padding_mask = batch_converter(
-        batch, device=device)
+        batch, device=device
+    )
 
     prev_output_tokens = tokens[:, :-1].to(device)
     target = tokens[:, 1:]
@@ -257,6 +258,7 @@ class CoordBatchConverter(BatchConverter):
         ]
         coords = self.collate_dense_tensors(coords, pad_v=np.nan)
         confidence = self.collate_dense_tensors(confidence, pad_v=-1.)
+        print("CB Converter running with device", device)
         if device is not None:
             coords = coords.to(device)
             confidence = confidence.to(device)
