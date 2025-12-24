@@ -85,7 +85,7 @@ class GVPTransformerModel(nn.Module):
         )
         return logits, extra
     
-    def _expand_encoder_out(encoder_out, B: int):
+    def _expand_encoder_out(self, encoder_out, B: int):
         # ESM inverse folding encoder_out is typically a dict with tensors shaped [T, 1, C] or similar.
         # We expand any singleton batch dim to B.
         if torch.is_tensor(encoder_out):
@@ -97,9 +97,9 @@ class GVPTransformerModel(nn.Module):
             return x
 
         if isinstance(encoder_out, dict):
-            return {k: _expand_encoder_out(v, B) for k, v in encoder_out.items()}
+            return {k: self._expand_encoder_out(v, B) for k, v in encoder_out.items()}
         if isinstance(encoder_out, (list, tuple)):
-            return type(encoder_out)(_expand_encoder_out(v, B) for v in encoder_out)
+            return type(encoder_out)(self._expand_encoder_out(v, B) for v in encoder_out)
         return encoder_out
 
     def sample(self, coords, B: int, partial_seq=None, temperature=1.0, confidence=None, device=None):
@@ -136,7 +136,7 @@ class GVPTransformerModel(nn.Module):
 
         with torch.inference_mode():
             encoder_out_1 = self.encoder(batch_coords, padding_mask, confidence)  # batch=1
-            encoder_out = _expand_encoder_out(encoder_out_1, B)
+            encoder_out = self._expand_encoder_out(encoder_out_1, B)
 
             for i in range(1, L + 1):
                 if fixed[i - 1]:
