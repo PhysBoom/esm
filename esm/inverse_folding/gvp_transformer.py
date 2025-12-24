@@ -103,33 +103,31 @@ class GVPTransformerModel(nn.Module):
         return encoder_out
 
     def sample(self, coords, B: int, partial_seq=None, temperature=1.0, confidence=None, device=None):
-        """
-        Batched sampling: returns B sequences for the same coords backbone.
+        import torch
+        import torch.nn.functional as F
 
-        coords: backbone coords in the same format expected by CoordBatchConverter
-            (typically a python/numpy structure; if you have a torch tensor,
-                pass coords.detach().cpu().numpy()).
-        """
         if device is None:
             device = next(self.parameters()).device
         device = torch.device(device)
 
-        # IMPORTANT: CoordBatchConverter expects non-CUDA python/numpy coords in most ESM builds.
-        # If you pass a torch Tensor here and get garbage outputs, convert it:
-        # if torch.is_tensor(coords): coords = coords.detach().cpu().numpy()
-
-        L = len(coords)
+        # CoordBatchConverter in ESM-IF1 typically expects python/numpy coords
+        if torch.is_tensor(coords):
+            coords_in = coords.detach().cpu().numpy()
+            L = coords.shape[0]
+        else:
+            coords_in = coords
+            L = len(coords)
 
         batch_converter = CoordBatchConverter(self.decoder.dictionary)
         batch_coords, confidence, _, _, padding_mask = (
-            batch_converter([(coords, confidence, None)], device=device)
+            batch_converter([(coords_in, confidence, None)], device=device)
         )
 
         d = self.decoder.dictionary
         mask_idx = d.get_idx("<mask>")
         cath_idx = d.get_idx("<cath>")
 
-        # Precompute fixed positions on CPU to avoid Python branching on CUDA tensors
+        # Fixed positions (CPU list to avoid CUDA sync in Python)
         fixed = [False] * L
         if partial_seq is not None:
             for j, c in enumerate(partial_seq):
@@ -140,18 +138,15 @@ class GVPTransformerModel(nn.Module):
         sampled_tokens = torch.full((B, 1 + L), mask_idx, device=device, dtype=torch.long)
         sampled_tokens[:, 0] = cath_idx
 
-        # Fill known tokens (same partial_seq for all B)
         if partial_seq is not None:
             for j, c in enumerate(partial_seq):
                 if fixed[j]:
                     sampled_tokens[:, j + 1] = d.get_idx(c)
 
-        # Encoder once (batch=1), then expand encoder outputs to batch=B
         with torch.inference_mode():
             encoder_out_1 = self.encoder(batch_coords, padding_mask, confidence)  # batch=1
             encoder_out = self._expand_encoder_out(encoder_out_1, B)
 
-            # Correctness-first: disable incremental_state (avoid cache shape pitfalls when expanding)
             for i in range(1, L + 1):
                 if fixed[i - 1]:
                     continue
@@ -159,30 +154,27 @@ class GVPTransformerModel(nn.Module):
                 logits, _ = self.decoder(
                     sampled_tokens[:, :i],
                     encoder_out,
-                    incremental_state=None,
+                    incremental_state=None,  # correctness-first
                 )
 
-                # Normalize logits to [T, B, V]
                 if logits.dim() != 3:
                     raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
 
-                # If [T, B, V]
-                if logits.size(1) == B:
+                # Normalize to [T, B, V]
+                if logits.size(1) == B:          # [T, B, V]
                     logits_tbv = logits
-                # If [B, T, V]
-                elif logits.size(0) == B:
+                elif logits.size(0) == B:        # [B, T, V] -> [T, B, V]
                     logits_tbv = logits.permute(1, 0, 2).contiguous()
                 else:
-                    raise RuntimeError(
-                        f"Can't infer batch dim from logits shape {tuple(logits.shape)} with B={B}"
-                    )
+                    raise RuntimeError(f"Can't infer batch dim: logits={tuple(logits.shape)} B={B}")
 
-                # Take logits for the newest position (0-based: i-1)
-                step_logits = logits_tbv[i - 1]  # [B, V]
+                # IMPORTANT: take the last timestep available (avoids off-by-one)
+                step_logits = logits_tbv[-1]     # [B, V]
+
                 probs = F.softmax(step_logits / temperature, dim=-1)
                 sampled_tokens[:, i] = torch.multinomial(probs, 1).squeeze(-1)
 
-        # Convert once per sequence (avoid per-token CUDA sync)
-        ids = sampled_tokens[:, 1:].detach().cpu().tolist()  # (B, L)
+        ids = sampled_tokens[:, 1:].detach().cpu().tolist()
         return ["".join(d.get_tok(t) for t in row) for row in ids]
+
 
