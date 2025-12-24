@@ -85,64 +85,77 @@ class GVPTransformerModel(nn.Module):
         )
         return logits, extra
     
-    def sample(self, coords, partial_seq=None, temperature=1.0, confidence=None, device=None):
-        """
-        Samples sequences based on multinomial sampling (no beam search).
+    def _expand_encoder_out(encoder_out, B: int):
+        # ESM inverse folding encoder_out is typically a dict with tensors shaped [T, 1, C] or similar.
+        # We expand any singleton batch dim to B.
+        if torch.is_tensor(encoder_out):
+            x = encoder_out
+            if x.dim() >= 2 and x.size(1) == 1:
+                return x.expand(x.size(0), B, *x.shape[2:]).contiguous()
+            if x.dim() >= 1 and x.size(0) == 1:
+                return x.expand(B, *x.shape[1:]).contiguous()
+            return x
 
-        Args:
-            coords: L x 3 x 3 list representing one backbone
-            partial_seq: Optional, partial sequence with mask tokens if part of
-                the sequence is known
-            temperature: sampling temperature, use low temperature for higher
-                sequence recovery and high temperature for higher diversity
-            confidence: optional length L list of confidence scores for coordinates
-        """
+        if isinstance(encoder_out, dict):
+            return {k: _expand_encoder_out(v, B) for k, v in encoder_out.items()}
+        if isinstance(encoder_out, (list, tuple)):
+            return type(encoder_out)(_expand_encoder_out(v, B) for v in encoder_out)
+        return encoder_out
+
+    def sample(self, coords, B: int, partial_seq=None, temperature=1.0, confidence=None, device=None):
+        if device is None:
+            device = next(self.parameters()).device
+        device = torch.device(device)
+
         L = len(coords)
-        # Convert to batch format
         batch_converter = CoordBatchConverter(self.decoder.dictionary)
         batch_coords, confidence, _, _, padding_mask = (
             batch_converter([(coords, confidence, None)], device=device)
         )
-        
-        # Start with prepend token
-        mask_idx = self.decoder.dictionary.get_idx('<mask>')
-        cath_idx = self.decoder.dictionary.get_idx('<cath>')
 
-        # Precompute which positions are fixed (CPU booleans) to avoid branching on CUDA tensors
+        d = self.decoder.dictionary
+        mask_idx = d.get_idx("<mask>")
+        cath_idx = d.get_idx("<cath>")
+
+        # fixed mask per position (same partial_seq applied to all B by default)
         fixed = [False] * L
         if partial_seq is not None:
             for j, c in enumerate(partial_seq):
-                if c is not None and c != '<mask>':
+                if c is not None and c != "<mask>":
                     fixed[j] = True
 
-        sampled_tokens = torch.full((1, 1+L), mask_idx, dtype=int)
-        sampled_tokens[0, 0] = cath_idx
+        sampled_tokens = torch.full((B, 1 + L), mask_idx, device=device, dtype=torch.long)
+        sampled_tokens[:, 0] = cath_idx
 
         if partial_seq is not None:
             for j, c in enumerate(partial_seq):
                 if fixed[j]:
-                    sampled_tokens[0, j + 1] = self.decoder.dictionary.get_idx(c)
-            
-        # Save incremental states for faster sampling
+                    sampled_tokens[:, j + 1] = d.get_idx(c)
+
         incremental_state = dict()
-        
-        # Run encoder only once
-        encoder_out = self.encoder(batch_coords, padding_mask, confidence)
-        
-        # Decode one token at a time
-        for i in range(1, L + 1):
-            if fixed[i - 1]:
-                continue
 
-            logits, _ = self.decoder(
-                sampled_tokens[:, :i],
-                encoder_out,
-                incremental_state=incremental_state,
-            )
-            logits = logits[0].transpose(0, 1)  # [1, vocab]
-            logits = logits / temperature
-            probs = F.softmax(logits, dim=-1)
-            sampled_tokens[:, i] = torch.multinomial(probs, 1).squeeze(-1)
+        with torch.inference_mode():
+            encoder_out_1 = self.encoder(batch_coords, padding_mask, confidence)  # batch=1
+            encoder_out = _expand_encoder_out(encoder_out_1, B)
 
-        ids = sampled_tokens[0, 1:].detach().cpu().tolist()
-        return ''.join(self.decoder.dictionary.get_tok(t) for t in ids)
+            for i in range(1, L + 1):
+                if fixed[i - 1]:
+                    continue
+
+                logits, _ = self.decoder(
+                    sampled_tokens[:, :i],
+                    encoder_out,
+                    incremental_state=incremental_state,
+                )
+
+                # last-step logits -> [B, V]
+                if logits.size(1) == B:          # [T, B, V]
+                    step_logits = logits[-1]
+                else:                             # [B, T, V]
+                    step_logits = logits[:, -1, :]
+
+                probs = F.softmax(step_logits / temperature, dim=-1)
+                sampled_tokens[:, i] = torch.multinomial(probs, 1).squeeze(-1)
+
+        ids = sampled_tokens[:, 1:].detach().cpu().tolist()
+        return ["".join(d.get_tok(t) for t in row) for row in ids]
