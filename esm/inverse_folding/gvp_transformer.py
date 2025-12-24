@@ -84,23 +84,6 @@ class GVPTransformerModel(nn.Module):
             return_all_hiddens=return_all_hiddens,
         )
         return logits, extra
-    
-    def _expand_encoder_out(self, encoder_out, B: int):
-        # ESM inverse folding encoder_out is typically a dict with tensors shaped [T, 1, C] or similar.
-        # We expand any singleton batch dim to B.
-        if torch.is_tensor(encoder_out):
-            x = encoder_out
-            if x.dim() >= 2 and x.size(1) == 1:
-                return x.expand(x.size(0), B, *x.shape[2:]).contiguous()
-            if x.dim() >= 1 and x.size(0) == 1:
-                return x.expand(B, *x.shape[1:]).contiguous()
-            return x
-
-        if isinstance(encoder_out, dict):
-            return {k: self._expand_encoder_out(v, B) for k, v in encoder_out.items()}
-        if isinstance(encoder_out, (list, tuple)):
-            return type(encoder_out)(self._expand_encoder_out(v, B) for v in encoder_out)
-        return encoder_out
 
     def sample(self, coords, B: int, partial_seq=None, temperature=1.0, confidence=None, device=None):
 
@@ -116,54 +99,60 @@ class GVPTransformerModel(nn.Module):
             L = len(coords)
             coords_in = coords
 
-        batch_converter = CoordBatchConverter(self.decoder.dictionary)
-        batch_coords, confidence, _, _, padding_mask = batch_converter([(coords_in, confidence, None)], device=device)
-
         d = self.decoder.dictionary
-        V = len(d)
+
+        # Build the set of allowed output token ids = standard amino acids
+        # (This is the key fix that avoids sampling invalid / special ids.)
+        aa_letters = list("ACDEFGHIKLMNPQRSTVWY")
+        allowed_ids = torch.tensor([d.get_idx(a) for a in aa_letters], device=device, dtype=torch.long)
+
+        # Optional: allow X if present in dict
+        try:
+            x_id = d.get_idx("X")
+            if x_id is not None and x_id >= 0:
+                allowed_ids = torch.cat([allowed_ids, torch.tensor([x_id], device=device)])
+        except Exception:
+            pass
 
         mask_idx = d.get_idx("<mask>")
         cath_idx = d.get_idx("<cath>")
 
-        # fixed positions
+        # Prepare a true batch for the encoder: B copies of the same coords
+        batch_converter = CoordBatchConverter(d)
+        items = [(coords_in, confidence, None)] * B
+        batch_coords, confidence_b, _, _, padding_mask = batch_converter(items, device=device)
+
+        # Tokens on GPU
+        sampled_tokens = torch.full((B, 1 + L), mask_idx, device=device, dtype=torch.long)
+        sampled_tokens[:, 0] = cath_idx
+
+        # Handle partial_seq (same partial for all B)
         fixed = [False] * L
         if partial_seq is not None:
             for j, c in enumerate(partial_seq):
                 if c is not None and c != "<mask>":
                     fixed[j] = True
-
-        sampled_tokens = torch.full((B, 1 + L), mask_idx, device=device, dtype=torch.long)
-        sampled_tokens[:, 0] = cath_idx
-
-        if partial_seq is not None:
-            for j, c in enumerate(partial_seq):
-                if fixed[j]:
                     sampled_tokens[:, j + 1] = d.get_idx(c)
 
         with torch.inference_mode():
-            encoder_out_1 = self.encoder(batch_coords, padding_mask, confidence)  # batch=1
-            encoder_out = self._expand_encoder_out(encoder_out_1, B)
+            encoder_out = self.encoder(batch_coords, padding_mask, confidence_b)
+
+            incremental_state = dict()
 
             for i in range(1, L + 1):
                 if fixed[i - 1]:
                     continue
 
-                # Guard: token ids must be valid before decoder (catches root cause)
-                mn = int(sampled_tokens[:, :i].min().detach().cpu())
-                mx = int(sampled_tokens[:, :i].max().detach().cpu())
-                if mn < 0 or mx >= V:
-                    raise RuntimeError(f"Token id out of range before decoder at i={i}: min={mn}, max={mx}, vocab={V}")
-
                 logits, _ = self.decoder(
                     sampled_tokens[:, :i],
                     encoder_out,
-                    incremental_state=None,  # correctness-first
+                    incremental_state=incremental_state,
                 )
 
                 if logits.dim() != 3:
                     raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
 
-                # Normalize to [T, B, V]
+                # Normalize logits to [T, B, Vlogits]
                 if logits.size(1) == B:          # [T, B, V]
                     logits_tbv = logits
                 elif logits.size(0) == B:        # [B, T, V] -> [T, B, V]
@@ -171,24 +160,25 @@ class GVPTransformerModel(nn.Module):
                 else:
                     raise RuntimeError(f"Can't infer batch dim: logits={tuple(logits.shape)} B={B}")
 
-                step_logits = logits_tbv[-1]  # [B, V]
+                step_logits_full = logits_tbv[-1]  # [B, Vlogits]
 
-                # Sanitize numeric issues
+                # Restrict to allowed amino-acid ids
+                step_logits = step_logits_full.index_select(dim=-1, index=allowed_ids)  # [B, |AA|]
+
+                # Sample within allowed set
                 step_logits = torch.nan_to_num(step_logits, nan=-1e9, posinf=1e9, neginf=-1e9)
                 probs = F.softmax(step_logits / temperature, dim=-1)
                 probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
                 probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-                next_tok = torch.multinomial(probs, 1).squeeze(-1)  # [B]
-                # Another guard
-                if (next_tok < 0).any() or (next_tok >= V).any():
-                    bad = next_tok[(next_tok < 0) | (next_tok >= V)][:10].detach().cpu().tolist()
-                    raise RuntimeError(f"Sampled out-of-range token(s) at i={i}: {bad} (vocab={V})")
+                choice = torch.multinomial(probs, 1).squeeze(-1)         # [B] in 0..|AA|-1
+                next_tok = allowed_ids.index_select(0, choice)           # map back to real token ids
 
                 sampled_tokens[:, i] = next_tok
 
         ids = sampled_tokens[:, 1:].detach().cpu().tolist()
         return ["".join(d.get_tok(t) for t in row) for row in ids]
+
 
 
 
