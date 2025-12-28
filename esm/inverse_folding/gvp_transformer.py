@@ -87,54 +87,132 @@ class GVPTransformerModel(nn.Module):
     
     def sample(self, coords, partial_seq=None, temperature=1.0, confidence=None, device=None):
         """
-        Samples sequences based on multinomial sampling (no beam search).
+        Batched multinomial sampling (no beam search).
 
         Args:
-            coords: L x 3 x 3 list representing one backbone
-            partial_seq: Optional, partial sequence with mask tokens if part of
-                the sequence is known
-            temperature: sampling temperature, use low temperature for higher
-                sequence recovery and high temperature for higher diversity
-            confidence: optional length L list of confidence scores for coordinates
+            coords: B x L x 3 x 3 (list or tensor)
+            partial_seq: optional known tokens; supports:
+                - List[str] length B, each length L (unknown chars treated as masked)
+                - List[List[str]] of shape B x L (unknown placeholders treated as masked)
+            temperature: float
+            confidence: optional B x L (list or tensor)
+            device: torch device (optional)
+        Returns:
+            List[str] of length B
         """
-        L = len(coords)
-        # Convert to batch format
+        # -----------------------
+        # Normalize inputs / infer B, L
+        # -----------------------
+        if isinstance(coords, torch.Tensor):
+            assert coords.dim() == 4 and coords.size(-2) == 3 and coords.size(-1) == 3, \
+                "coords must be BxLx3x3"
+            B, L = coords.shape[:2]
+            coords_tensor = coords
+        else:
+            # Assume nested list: B x L x 3 x 3
+            B = len(coords)
+            L = len(coords[0]) if B > 0 else 0
+            coords_tensor = None
+
+        if device is None:
+            device = (coords.device if isinstance(coords, torch.Tensor) else None)
+
         batch_converter = CoordBatchConverter(self.decoder.dictionary)
-        batch_coords, confidence, _, _, padding_mask = (
-            batch_converter([(coords, confidence, None)], device=device)
+        if coords_tensor is not None:
+            # Convert tensor -> python list for converter if it doesn't support tensors.
+            # If CoordBatchConverter *does* support tensors directly, you can remove this branch.
+            coords_list = coords_tensor.detach().cpu().tolist()
+            conf_list = confidence.detach().cpu().tolist() if isinstance(confidence, torch.Tensor) else confidence
+            items = [(coords_list[b], (conf_list[b] if conf_list is not None else None), None) for b in range(B)]
+        else:
+            # coords is already a python list
+            conf_list = confidence
+            items = [(coords[b], (conf_list[b] if conf_list is not None else None), None) for b in range(B)]
+
+        batch_coords, confidence_batch, _, _, padding_mask = batch_converter(items, device=device)
+        d = self.decoder.dictionary
+        mask_idx = d.get_idx("<mask>")
+        cath_idx = d.get_idx("<cath>")
+
+        sampled_tokens = torch.full(
+            (B, 1 + L),
+            fill_value=mask_idx,
+            dtype=torch.long,
+            device=device if device is not None else None,
         )
-        
-        # Start with prepend token
-        mask_idx = self.decoder.dictionary.get_idx('<mask>')
-        sampled_tokens = torch.full((1, 1+L), mask_idx, dtype=int)
-        sampled_tokens[0, 0] = self.decoder.dictionary.get_idx('<cath>')
+        sampled_tokens[:, 0] = cath_idx
+
+        # Apply partial sequence if provided
         if partial_seq is not None:
-            for i, c in enumerate(partial_seq):
-                sampled_tokens[0, i+1] = self.decoder.dictionary.get_idx(c)
-            
-        # Save incremental states for faster sampling
-        incremental_state = dict()
-        
-        # Run encoder only once
-        encoder_out = self.encoder(batch_coords, padding_mask, confidence)
-        
-        # Make sure all tensors are on the same device if a GPU is present
-        if device:
-            sampled_tokens = sampled_tokens.to(device)
-        
-        # Decode one token at a time
-        for i in range(1, L+1):
+            # Accept List[str] or List[List[str]]
+            if isinstance(partial_seq[0], str):
+                # List[str] length B, each string length L
+                # Treat non-alphabet / unknown markers as masked (customize as you like)
+                for b in range(B):
+                    s = partial_seq[b]
+                    for i in range(min(L, len(s))):
+                        c = s[i]
+                        if c not in {"?", "*", "-", "_", " "}:
+                            sampled_tokens[b, i + 1] = d.get_idx(c)
+            else:
+                # List[List[str]] shape BxL
+                for b in range(B):
+                    row = partial_seq[b]
+                    for i in range(min(L, len(row))):
+                        c = row[i]
+                        if c is None:
+                            continue
+                        if isinstance(c, str) and c in {"<mask>", "?", "*", "-", "_", " "}:
+                            continue
+                        sampled_tokens[b, i + 1] = d.get_idx(c)
+
+        encoder_out = self.encoder(batch_coords, padding_mask, confidence_batch)
+        incremental_state = {}
+
+        # Autoregressive loop over positions (cannot be parallelized without changing the model)
+        for i in range(1, L + 1):
+            # Only sample for sequences where this position is still masked
+            need = (sampled_tokens[:, i] == mask_idx)
+            if not torch.any(need):
+                # Everyone already fixed at this position
+                continue
+
+            # With incremental_state, you can usually feed ONLY the newest token.
+            # First step needs the start token; subsequent steps feed the last generated token.
+            if i == 1:
+                decoder_in = sampled_tokens[:, :1]          # (B, 1)
+            else:
+                decoder_in = sampled_tokens[:, i - 1:i]     # (B, 1)
+
             logits, _ = self.decoder(
-                sampled_tokens[:, :i], 
+                decoder_in,
                 encoder_out,
                 incremental_state=incremental_state,
             )
-            logits = logits[0].transpose(0, 1)
-            logits /= temperature
-            probs = F.softmax(logits, dim=-1)
-            if sampled_tokens[0, i] == mask_idx:
-                sampled_tokens[:, i] = torch.multinomial(probs, 1).squeeze(-1)
-        sampled_seq = sampled_tokens[0, 1:]
-        
-        # Convert back to string via lookup
-        return ''.join([self.decoder.dictionary.get_tok(a) for a in sampled_seq])
+
+            # Many fairseq-style decoders return T x B x V. We only need the last step.
+            # Handle both T x B x V and B x T x V just in case.
+            if logits.dim() == 3 and logits.size(0) == decoder_in.size(1):
+                # T x B x V
+                step_logits = logits[-1]                   # (B, V)
+            elif logits.dim() == 3 and logits.size(1) == decoder_in.size(1):
+                # B x T x V
+                step_logits = logits[:, -1]                # (B, V)
+            else:
+                raise RuntimeError(f"Unexpected logits shape: {tuple(logits.shape)}")
+
+            step_logits = step_logits / float(temperature)
+            step_probs = F.softmax(step_logits, dim=-1)     # (B, V)
+
+            # Sample only where needed; keep others unchanged
+            sampled = torch.multinomial(step_probs[need], 1).squeeze(-1)
+            sampled_tokens[need, i] = sampled
+
+        # -----------------------
+        # Convert tokens -> strings
+        # -----------------------
+        out = []
+        for b in range(B):
+            toks = sampled_tokens[b, 1:].tolist()
+            out.append("".join(d.get_tok(t) for t in toks))
+        return out
